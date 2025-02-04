@@ -10,4 +10,4 @@ def extract_features(packet):
     }
     return features
 
-sniff(prn=lambda pkt: print(extract_features(pkt)), count=10)
+sniff(prn=lambda pkt: print(extract_features(pkt)))

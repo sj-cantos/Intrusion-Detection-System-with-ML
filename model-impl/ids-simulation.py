@@ -36,6 +36,7 @@ def extract_features(packet):
     return None
 
 def predict_attack(packet):
+    
     features = extract_features(packet)
     if features:
         try:
@@ -54,4 +55,4 @@ def predict_attack(packet):
             print(f"Error processing packet: {e}")
 
 
-sniff(prn=predict_attack, filter="ip", iface="Wi-Fi", count=10)
+sniff(prn=predict_attack, filter="ip", iface="Wi-Fi")
