@@ -1,58 +1,76 @@
-import joblib
-import pandas as pd
 from scapy.all import sniff, IP, TCP, UDP
+import pandas as pd
+import numpy as np
+import joblib
 
+# Load trained model and preprocessing tools
+clf = joblib.load('ids_model.pkl')
+scaler = joblib.load('scaler.pkl')
+train_columns = joblib.load('train_columns.pkl')
+label_encoder = joblib.load('label_encoder.pkl')
 
-clf = joblib.load("ids_model.pkl")  
-scaler = joblib.load("scaler.pkl") 
-label_encoder = joblib.load("label_encoder.pkl")  
+# Mapping known services
+service_ports = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+                 80: "http", 443: "https", 445: "smb", 3306: "mysql"}
 
-
-expected_features = scaler.feature_names_in_
-
+# Extract features from packets
 def extract_features(packet):
     if IP in packet:
         protocol_type = "tcp" if TCP in packet else "udp" if UDP in packet else "other"
+        service = service_ports.get(packet.dport, "unknown")
 
-        # Check if the packet has a destination port
-        if TCP in packet or UDP in packet:
-            dport = packet[TCP].dport if TCP in packet else packet[UDP].dport
-            service = "http" if dport == 80 else "https" if dport == 443 else "unknown"
-        else:
-            service = "unknown"
-
-        flag = "SF" if TCP in packet and packet[TCP].flags == 0x02 else "OTH"
+        flag = "OTH"
+        if TCP in packet:
+            flags = packet[TCP].flags
+            if flags & 0x02:  # SYN
+                flag = "S0"
+            elif flags & 0x12:  # SYN-ACK
+                flag = "S1"
+            elif flags & 0x10:  # ACK
+                flag = "SF"
 
         features = {
-            'duration': 1,  # Placeholder
+            'duration': 1,  # Live packets don't have "duration" so setting it as 1
             'protocol_type': protocol_type,
             'service': service,
             'flag': flag,
-            'src_bytes': len(packet),  # Packet size from source
-            'dst_bytes': 0,  # Placeholder
-            'wrong_fragment': 0  # Placeholder
+            'src_bytes': len(packet),
+            'dst_bytes': 0,  # Can't calculate in real-time
+            'wrong_fragment': 0
         }
+        
         return features
     return None
 
-def predict_attack(packet):
-    
+# Convert extracted features into a format the model understands
+def preprocess_features(features):
+    df = pd.DataFrame([features])
+
+    # One-hot encode categorical values
+    df = pd.get_dummies(df, columns=['protocol_type', 'service', 'flag'])
+
+    # Ensure all columns match the training set
+    missing_cols = set(train_columns) - set(df.columns)
+    if missing_cols:
+        df = pd.concat([df, pd.DataFrame(0, index=df.index, columns=list(missing_cols))], axis=1)
+    df = df[train_columns]  # Ensure correct column order
+
+    df = df[train_columns]  # Reorder columns
+
+    # Scale numerical values
+    return scaler.transform(df)
+
+# Detect attack from live packets
+def detect_attack(packet):
     features = extract_features(packet)
     if features:
-        try:
-            new_data = pd.DataFrame([features])
-            new_data = pd.get_dummies(new_data)
-            new_data = new_data.reindex(columns=expected_features, fill_value=0)
+        processed_features = preprocess_features(features)
+        prediction = clf.predict(processed_features)
+        attack_type = label_encoder.inverse_transform(prediction)[0]
 
-            new_data = scaler.transform(new_data)
-            prediction = clf.predict(new_data)
-            predicted_label = label_encoder.inverse_transform(prediction)
+        print(f"🔍 Packet: {packet.summary()}")
+        print(f"🛑 Detected Attack: {attack_type}\n")
 
-            print(f" Predicted Attack Type: {predicted_label[0]}")
-            print(f" Predicted Class: {prediction}")
-
-        except Exception as e:
-            print(f"Error processing packet: {e}")
-
-
-sniff(prn=predict_attack, filter="ip", iface="Wi-Fi")
+# Sniff packets and analyze them in real-time
+print("🚀 IDS Running... Capturing Live Packets...")
+sniff(prn=detect_attack, store=0)
