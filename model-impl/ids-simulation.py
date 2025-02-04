@@ -1,76 +1,100 @@
-from scapy.all import sniff, IP, TCP, UDP
+import joblib
 import pandas as pd
 import numpy as np
-import joblib
+from scapy.all import sniff
+from sklearn.preprocessing import StandardScaler
 
-# Load trained model and preprocessing tools
-clf = joblib.load('ids_model.pkl')
+# Load the pre-trained model, label encoder, and scaler
+model = joblib.load('ids_model.pkl')
+label_encoder = joblib.load('label_encoder.pkl')
 scaler = joblib.load('scaler.pkl')
 train_columns = joblib.load('train_columns.pkl')
-label_encoder = joblib.load('label_encoder.pkl')
 
-# Mapping known services
-service_ports = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
-                 80: "http", 443: "https", 445: "smb", 3306: "mysql"}
-
-# Extract features from packets
+# Define function to extract features from packets
 def extract_features(packet):
-    if IP in packet:
-        protocol_type = "tcp" if TCP in packet else "udp" if UDP in packet else "other"
-        service = service_ports.get(packet.dport, "unknown")
+    # Basic feature extraction from packet (e.g., protocol type, source/destination port, bytes, etc.)
+    features = {
+        "duration": 0,  # Set default or calculate based on packet times
+        "protocol_type": packet.proto if packet.haslayer('IP') else 0,  # Just an example, extend as needed
+        "service": 0,  # Placeholder
+        "flag": 0,  # Placeholder
+        "src_bytes": len(packet),  # Just an example feature (length of packet)
+        "dst_bytes": len(packet),  # Placeholder
+        "land": 0,  # Placeholder, check for special network conditions
+        "wrong_fragment": 0,  # Placeholder
+        "urgent": 0,  # Placeholder
+        "hot": 0,  # Placeholder
+        "num_failed_logins": 0,  # Placeholder
+        "logged_in": 0,  # Placeholder
+        "num_compromised": 0,  # Placeholder
+        "root_shell": 0,  # Placeholder
+        "su_attempted": 0,  # Placeholder
+        "num_root": 0,  # Placeholder
+        "num_file_creations": 0,  # Placeholder
+        "num_shells": 0,  # Placeholder
+        "num_access_files": 0,  # Placeholder
+        "num_outbound_cmds": 0,  # Placeholder
+        "is_host_login": 0,  # Placeholder
+        "is_guest_login": 0,  # Placeholder
+        "count": 0,  # Placeholder
+        "srv_count": 0,  # Placeholder
+        "serror_rate": 0,  # Placeholder
+        "srv_serror_rate": 0,  # Placeholder
+        "rerror_rate": 0,  # Placeholder
+        "srv_rerror_rate": 0,  # Placeholder
+        "same_srv_rate": 0,  # Placeholder
+        "diff_srv_rate": 0,  # Placeholder
+        "srv_diff_host_rate": 0,  # Placeholder
+        "dst_host_count": 0,  # Placeholder
+        "dst_host_srv_count": 0,  # Placeholder
+        "dst_host_same_srv_rate": 0,  # Placeholder
+        "dst_host_diff_srv_rate": 0,  # Placeholder
+        "dst_host_same_src_port_rate": 0,  # Placeholder
+        "dst_host_srv_diff_host_rate": 0,  # Placeholder
+        "dst_host_serror_rate": 0,  # Placeholder
+        "dst_host_srv_serror_rate": 0,  # Placeholder
+        "dst_host_rerror_rate": 0,  # Placeholder
+        "dst_host_srv_rerror_rate": 0,  # Placeholder
+    }
 
-        flag = "OTH"
-        if TCP in packet:
-            flags = packet[TCP].flags
-            if flags & 0x02:  # SYN
-                flag = "S0"
-            elif flags & 0x12:  # SYN-ACK
-                flag = "S1"
-            elif flags & 0x10:  # ACK
-                flag = "SF"
+    # Convert features to DataFrame
+    feature_df = pd.DataFrame([features])
+    
+    # One-Hot Encoding for Categorical Features (protocol_type, service, flag)
+    feature_df = pd.get_dummies(feature_df, columns=['protocol_type', 'service', 'flag'])
+    
+    # Align feature columns with the model's expected feature set
+    missing_columns = [col for col in train_columns if col not in feature_df.columns]
+    for col in missing_columns:
+        feature_df[col] = 0  # Fill missing columns with 0 or default value
+    
+    # Reorder columns to match the trained model's columns
+    feature_df = feature_df[train_columns]
+    
+    return feature_df
 
-        features = {
-            'duration': 1,  # Live packets don't have "duration" so setting it as 1
-            'protocol_type': protocol_type,
-            'service': service,
-            'flag': flag,
-            'src_bytes': len(packet),
-            'dst_bytes': 0,  # Can't calculate in real-time
-            'wrong_fragment': 0
-        }
-        
-        return features
-    return None
-
-# Convert extracted features into a format the model understands
-def preprocess_features(features):
-    df = pd.DataFrame([features])
-
-    # One-hot encode categorical values
-    df = pd.get_dummies(df, columns=['protocol_type', 'service', 'flag'])
-
-    # Ensure all columns match the training set
-    missing_cols = set(train_columns) - set(df.columns)
-    if missing_cols:
-        df = pd.concat([df, pd.DataFrame(0, index=df.index, columns=list(missing_cols))], axis=1)
-    df = df[train_columns]  # Ensure correct column order
-
-    df = df[train_columns]  # Reorder columns
-
-    # Scale numerical values
-    return scaler.transform(df)
-
-# Detect attack from live packets
-def detect_attack(packet):
+# Function to classify packets
+def classify_packet(packet):
+    # Extract features from the packet
     features = extract_features(packet)
-    if features:
-        processed_features = preprocess_features(features)
-        prediction = clf.predict(processed_features)
-        attack_type = label_encoder.inverse_transform(prediction)[0]
+    
+    # Standardize the features
+    features_scaled = scaler.transform(features)
+    
+    # Predict with the trained model
+    prediction = model.predict(features_scaled)
+    predicted_label = label_encoder.inverse_transform(prediction)[0]
+    
+    # Log or alert based on the prediction
+    if predicted_label == 1:  # If it's an attack (assuming label 1 corresponds to an attack)
+        print("Attack detected! Packet:", packet.summary())
+    else:
+        print("Normal traffic detected. Packet:", packet.summary())
 
-        print(f"🔍 Packet: {packet.summary()}")
-        print(f"🛑 Detected Attack: {attack_type}\n")
+# Start sniffing network traffic
+def start_sniffing():
+    print("Starting packet sniffing...")
+    sniff(prn=classify_packet, store=0)  # Capture packets and classify them in real-time
 
-# Sniff packets and analyze them in real-time
-print("🚀 IDS Running... Capturing Live Packets...")
-sniff(prn=detect_attack, store=0)
+if __name__ == "__main__":
+    start_sniffing()
