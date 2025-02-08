@@ -1,76 +1,233 @@
-from scapy.all import sniff, IP, TCP, UDP
-import pandas as pd
+import torch
 import numpy as np
 import joblib
+from torch import nn
 
-# Load trained model and preprocessing tools
-clf = joblib.load('ids_model.pkl')
-scaler = joblib.load('scaler.pkl')
-train_columns = joblib.load('train_columns.pkl')
-label_encoder = joblib.load('label_encoder.pkl')
+# Load preprocessing artifacts
+scaler = joblib.load("model-impl/scaler.pkl")
+label_encoder = joblib.load("model-impl/label_encoder.pkl")
 
-# Mapping known services
-service_ports = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
-                 80: "http", 443: "https", 445: "smb", 3306: "mysql"}
+# Define the model architecture (must match training)
+class OriginalNet(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.3)
+        )
+        self.lstm = nn.LSTM(64, 128, num_layers=2, 
+                           bidirectional=True, 
+                           batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
 
-# Extract features from packets
-def extract_features(packet):
-    if IP in packet:
-        protocol_type = "tcp" if TCP in packet else "udp" if UDP in packet else "other"
-        service = service_ports.get(packet.dport, "unknown")
+    def forward(self, x):
+        x = self.conv_block(x)
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm(x)
+        return self.classifier(x[:, -1, :])
+# Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = OriginalNet(
+    input_size=scaler.n_features_in_,
+    num_classes=len(label_encoder.classes_)
+).to(device)
+model.load_state_dict(torch.load("model-impl/best_model.pth", map_location=device))
+model.eval()
 
-        flag = "OTH"
-        if TCP in packet:
-            flags = packet[TCP].flags
-            if flags & 0x02:  # SYN
-                flag = "S0"
-            elif flags & 0x12:  # SYN-ACK
-                flag = "S1"
-            elif flags & 0x10:  # ACK
-                flag = "SF"
+def extract_features(raw_packet):
+    """Simulated feature extraction - replace with your actual implementation"""
+    # This should implement the same feature extraction as used in CICIDS2017
+    # For demonstration, return random features with correct dimension
+    return np.random.randn(scaler.n_features_in_)  # 77 features
 
-        features = {
-            'duration': 1,  # Live packets don't have "duration" so setting it as 1
-            'protocol_type': protocol_type,
-            'service': service,
-            'flag': flag,
-            'src_bytes': len(packet),
-            'dst_bytes': 0,  # Can't calculate in real-time
-            'wrong_fragment': 0
-        }
+def preprocess_live_data(raw_packet):
+    """Process raw network packet into model-ready format"""
+    # Feature extraction
+    features = extract_features(raw_packet)
+    
+    # Validate feature dimensions
+    if len(features) != scaler.n_features_in_:
+        raise ValueError(f"Expected {scaler.n_features_in_} features, got {len(features)}")
+    
+    # Scale features
+    scaled = scaler.transform([features])
+    
+    # Convert to tensor
+    return torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+
+def detect_anomalies(packet):
+    """Detect anomalies in live network traffic"""
+    with torch.no_grad():
+        # Preprocess and predict
+        inputs = preprocess_live_data(packet)
+        outputs = model(inputs)
         
-        return features
-    return None
+        # Get probabilities and predictions
+        probs = torch.softmax(outputs, dim=1)
+        conf, pred = torch.max(probs, dim=1)
+        
+        # Decode prediction
+        return {
+            "probabilities": probs.cpu().numpy()[0],
+            "predicted_class": label_encoder.inverse_transform(pred.cpu())[0],
+            "confidence": conf.item()
+        }
+from scapy.all import sniff, IP, TCP, UDP
+import time
+from collections import defaultdict
 
-# Convert extracted features into a format the model understands
-def preprocess_features(features):
-    df = pd.DataFrame([features])
+# Flow tracking dictionary
+flow_stats = defaultdict(lambda: {
+    'start_time': None,
+    'end_time': None,
+    'packet_count': 0,
+    'bytes': 0,
+    'protocol': None,
+    'flags': set(),
+    'packet_lengths': [],
+    'iat': []
+})
 
-    # One-hot encode categorical values
-    df = pd.get_dummies(df, columns=['protocol_type', 'service', 'flag'])
+def process_packet(packet):
+    """Process live network packets and maintain flow statistics"""
+    try:
+        if IP in packet:
+            current_time = time.time()  # Get timestamp once per packet
 
-    # Ensure all columns match the training set
-    missing_cols = set(train_columns) - set(df.columns)
-    if missing_cols:
-        df = pd.concat([df, pd.DataFrame(0, index=df.index, columns=list(missing_cols))], axis=1)
-    df = df[train_columns]  # Ensure correct column order
+            src = f"{packet[IP].src}:{packet.sport}" if TCP in packet or UDP in packet else packet[IP].src
+            dst = f"{packet[IP].dst}:{packet.dport}" if TCP in packet or UDP in packet else packet[IP].dst
+            flow_id = (src, dst) if src < dst else (dst, src)
 
-    df = df[train_columns]  # Reorder columns
+            # Update flow statistics
+            stats = flow_stats[flow_id]
+            if not stats['start_time']:
+                stats['start_time'] = current_time
+                stats['protocol'] = packet[IP].proto
+                stats['end_time'] = current_time  # Initialize end_time
+            else:
+                # Calculate inter-arrival time correctly
+                stats['iat'].append(current_time - stats['end_time'])
+                stats['end_time'] = current_time
 
-    # Scale numerical values
-    return scaler.transform(df)
+            stats['packet_count'] += 1
+            stats['bytes'] += len(packet)
+            stats['packet_lengths'].append(len(packet))
 
-# Detect attack from live packets
-def detect_attack(packet):
-    features = extract_features(packet)
-    if features:
-        processed_features = preprocess_features(features)
-        prediction = clf.predict(processed_features)
-        attack_type = label_encoder.inverse_transform(prediction)[0]
+            if TCP in packet:
+                stats['flags'].add(packet[TCP].flags)
+                
+            # Check flow timeout (15 seconds of inactivity)
+            if current_time - stats['end_time'] > 15:
+                analyze_flow(flow_id, stats)
+                del flow_stats[flow_id]
 
-        print(f"🔍 Packet: {packet.summary()}")
-        print(f"🛑 Detected Attack: {attack_type}\n")
+    except Exception as e:
+        print(f"Error processing packet: {e}")
+def extract_flow_features(flow_stats):
+    """Convert flow statistics to CICIDS2017 features (simplified example)"""
+    # This must implement the EXACT same features as used in training
+    # Here's a simplified version - you need to implement the full 77 features
+    features = [
+        len(flow_stats['packet_lengths']),           # Total Packets
+        sum(flow_stats['packet_lengths']),           # Total Bytes
+        np.mean(flow_stats['packet_lengths']),       # Average Packet Size
+        np.std(flow_stats['packet_lengths']),        # Packet Size Std Dev
+        flow_stats['end_time'] - flow_stats['start_time'],  # Flow Duration
+        len(flow_stats['flags']),                    # Unique Flags Count
+        # ... Add all 77 features here ...
+    ]
+    return np.array(features)
 
-# Sniff packets and analyze them in real-time
-print("🚀 IDS Running... Capturing Live Packets...")
-sniff(prn=detect_attack, store=0)
+def analyze_flow(flow_id, stats):
+    """Analyze completed network flow"""
+    try:
+        # Extract features
+        features = extract_flow_features(stats)
+        
+        # Detect anomalies
+        result = detect_anomalies(features)  # Pass features directly
+        
+        # Generate alert if anomaly detected
+        if result['predicted_class'] != 'Benign':
+            print(f" ANOMALY DETECTED ")
+            print(f"Flow: {flow_id[0]} → {flow_id[1]}")
+            print(f"Type: {result['predicted_class']}")
+            print(f"Confidence: {result['confidence']:.2%}")
+            
+            # Add your alerting logic here (email, SMS, SIEM integration, etc.)
+            
+        else:
+            print(f"✓ Normal traffic: {flow_id[0]} → {flow_id[1]}")
+
+    except Exception as e:
+        print(f"Error analyzing flow: {e}")
+
+import logging
+from scapy.all import (
+    IP, TCP, UDP, ICMP,  # Explicit protocol imports
+    Ether, Raw,           # Additional layers seen in your logs
+    sniff
+)
+from scapy.all import sniff, conf, get_if_list
+import time
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def show_interfaces():
+    """List available network interfaces"""
+    print("Available interfaces:")
+    for interface in get_if_list():
+        print(f"  - {interface.decode() if isinstance(interface, bytes) else interface}")
+
+def packet_handler(packet):
+    """Simplified debug version of packet processor"""
+    try:
+        logging.info(f"Received packet from: {packet.summary()}")
+        
+        # Immediate test: ping detection
+        if packet.haslayer(ICMP) and packet[ICMP].type == 8:  # ICMP echo request
+            logging.warning("Ping detected! Generating test alert...")
+            print("\nTEST ALERT: Ping detected")
+            
+    except Exception as e:
+        logging.error(f"Error processing packet: {e}")
+
+if __name__ == "__main__":
+    show_interfaces()
+    interface = "Wi-Fi"  # Update this to your interface
+    
+    print(f"\nStarting monitoring on {interface}...")
+    print("Send test traffic (e.g., ping or browse) to verify")
+    print("Press Ctrl+C to stop\n")
+
+    # Capture packets with timeout
+    try:
+        # Store packets temporarily for verification
+        packets = sniff(
+            iface=interface,
+            filter="tcp or udp or icmp",
+            prn=packet_handler,
+            store=1,
+            timeout=10
+        )
+        
+        result = detect_anomalies(packets)
+    
+        print(f"Predicted: {result['predicted_class']}")
+        print(f"Confidence: {result['confidence']:.2%}")
+       
+
+
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped by user")
