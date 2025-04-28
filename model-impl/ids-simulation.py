@@ -102,23 +102,26 @@ def preprocess_live_data(raw_packet):
     # Convert to tensor
     return torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
 
-def detect_anomalies(packet):
-    """Detect anomalies in live network traffic"""
-    with torch.no_grad():
-        # Preprocess and predict
-        inputs = preprocess_live_data(packet)
-        outputs = model(inputs)
-        
-        # Get probabilities and predictions
-        probs = torch.softmax(outputs, dim=1)
-        conf, pred = torch.max(probs, dim=1)
-        
-        # Decode prediction
-        return {
-            "probabilities": probs.cpu().numpy()[0],
-            "predicted_class": label_encoder.inverse_transform(pred.cpu())[0],
-            "confidence": conf.item()
-        }
+def detect_anomalies(features):
+    """
+    Detect anomalies in the extracted features.
+    features: a single feature vector (already preprocessed)
+    """
+    # No need to preprocess again
+    features = np.array(features).reshape(1, -1)
+    
+    # Normalize or scale your input if needed
+    # features = scaler.transform(features)  # If you trained with scaling
+
+    prediction = model.predict(features)
+    predicted_class = encoder.inverse_transform(prediction)[0]
+    confidence = np.max(model.predict_proba(features))
+
+    return {
+        'predicted_class': predicted_class,
+        'confidence': confidence
+    }
+
 from scapy.all import sniff, IP, TCP, UDP
 import time
 from collections import defaultdict
@@ -244,15 +247,14 @@ def packet_handler(packet):
 
 if __name__ == "__main__":
     show_interfaces()
-    interface = "Wi-Fi"  # Update this to your interface
-    
+    interface = "Wi-Fi"  # Update to your correct interface
+
     print(f"\nStarting monitoring on {interface}...")
     print("Send test traffic (e.g., ping or browse) to verify")
     print("Press Ctrl+C to stop\n")
 
-    # Capture packets with timeout
     try:
-        # Store packets temporarily for verification
+        # Capture packets temporarily for verification
         packets = sniff(
             iface=interface,
             filter="tcp or udp or icmp",
@@ -261,12 +263,30 @@ if __name__ == "__main__":
             timeout=10
         )
         
-        result = detect_anomalies(packets)
-    
-        print(f"Predicted: {result['predicted_class']}")
-        print(f"Confidence: {result['confidence']:.2%}")
-       
+        # Instead of passing raw packets, simulate a flow first
+        if packets:
+            # Create a dummy flow_stats from captured packets (basic example)
+            dummy_flow = {
+                'start_time': time.time(),
+                'end_time': time.time() + 1,
+                'packet_count': len(packets),
+                'bytes': sum(len(pkt) for pkt in packets),
+                'protocol': packets[0][IP].proto if IP in packets[0] else None,
+                'flags': set(pkt[TCP].flags for pkt in packets if TCP in pkt),
+                'packet_lengths': [len(pkt) for pkt in packets],
+                'iat': []  # Could calculate real IATs if needed
+            }
 
+            # Now properly extract features
+            features = extract_flow_features(dummy_flow)
+
+            # Then detect anomaly
+            result = detect_anomalies(features)
+
+            print(f"Predicted: {result['predicted_class']}")
+            print(f"Confidence: {result['confidence']:.2%}")
+        else:
+            print("No packets captured.")
 
     except KeyboardInterrupt:
-        print("\nMonitoring stopped by user")
+        print("\nMonitoring stopped by user.")
