@@ -102,25 +102,31 @@ def preprocess_live_data(raw_packet):
     # Convert to tensor
     return torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
 
-def detect_anomalies(features):
-    """
-    Detect anomalies in the extracted features.
-    features: a single feature vector (already preprocessed)
-    """
-    # No need to preprocess again
-    features = np.array(features).reshape(1, -1)
-    
-    # Normalize or scale your input if needed
-    # features = scaler.transform(features)  # If you trained with scaling
+import torch
 
-    prediction = model.predict(features)
-    predicted_class = encoder.inverse_transform(prediction)[0]
-    confidence = np.max(model.predict_proba(features))
+def detect_anomalies(features):
+    model.eval()
+
+    with torch.no_grad():
+        inputs = torch.tensor(features, dtype=torch.float32)
+
+        # Reshape input: (batch_size=1, channels=1, length=features_dim)
+        inputs = inputs.unsqueeze(0).unsqueeze(0)  
+        # OR: inputs = inputs.view(1, 1, -1)
+
+        outputs = model(inputs)
+
+        probabilities = torch.softmax(outputs, dim=1)
+        confidence, predicted_class = torch.max(probabilities, 1)
+
+        predicted_class = predicted_class.item()
+        confidence = confidence.item()
 
     return {
         'predicted_class': predicted_class,
         'confidence': confidence
     }
+
 
 from scapy.all import sniff, IP, TCP, UDP
 import time
