@@ -179,20 +179,98 @@ def process_packet(packet):
 
     except Exception as e:
         print(f"Error processing packet: {e}")
-def extract_flow_features(flow_stats):
-    """Convert flow statistics to CICIDS2017 features (simplified example)"""
-    # This must implement the EXACT same features as used in training
-    # Here's a simplified version - you need to implement the full 77 features
+import numpy as np
+import time
+from scapy.layers.inet import TCP
+
+flow_stats = {
+    "timestamps": [],
+    "packet_lengths": [],
+    "flags": [],
+}
+def parse_flags(f):
+    from scapy.all import FlagValue
+
+    flag_map = {
+        'FIN': 0x01,
+        'SYN': 0x02,
+        'RST': 0x04,
+        'PSH': 0x08,
+        'ACK': 0x10,
+        'URG': 0x20,
+    }
+
+    if isinstance(f, int):
+        return f
+    elif isinstance(f, FlagValue):
+        return int(f)
+    elif isinstance(f, set):
+        bits = 0
+        for flag in f:
+            flag_str = str(flag).upper()  # <--- MAKE SURE the flag is a string
+            bits |= flag_map.get(flag_str, 0)
+        return bits
+    else:
+        return 0
+
+def extract_flow_features(packet):
+    # Check if packet is a dict or scapy packet
+    if isinstance(packet, dict):
+        # Assume dict already has fields
+        packet_len = packet.get('length', 0)
+        flags = packet.get('flags', 0)
+    else:
+        # Scapy packet
+        packet_len = len(packet)
+        flags = 0
+        if packet.haslayer(TCP):
+            flags = packet[TCP].flags
+
+    # 1. Capture timestamp and packet length
+    flow_stats["timestamps"].append(time.time())
+    flow_stats["packet_lengths"].append(packet_len)
+    flow_stats["flags"].append(flags)
+
+    # 2. Compute features
+    timestamps = flow_stats["timestamps"]
+    packet_lengths = flow_stats["packet_lengths"]
+    flags_list = flow_stats["flags"]
+
+    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0
+
+    total_packets = len(packet_lengths)
+    total_bytes = np.sum(packet_lengths)
+    mean_pkt_size = np.mean(packet_lengths)
+    std_pkt_size = np.std(packet_lengths)
+    max_pkt_size = np.max(packet_lengths)
+    min_pkt_size = np.min(packet_lengths)
+
+    pkt_rate = total_packets / duration if duration > 0 else 0
+    byte_rate = total_bytes / duration if duration > 0 else 0
+
+    syn_count = sum(1 for f in flags_list if parse_flags(f) & 0x02)
+    ack_count = sum(1 for f in flags_list if parse_flags(f) & 0x10)
+    rst_count = sum(1 for f in flags_list if parse_flags(f) & 0x04)
+    fin_count = sum(1 for f in flags_list if parse_flags(f) & 0x01)
+
     features = [
-        len(flow_stats['packet_lengths']),           # Total Packets
-        sum(flow_stats['packet_lengths']),           # Total Bytes
-        np.mean(flow_stats['packet_lengths']),       # Average Packet Size
-        np.std(flow_stats['packet_lengths']),        # Packet Size Std Dev
-        flow_stats['end_time'] - flow_stats['start_time'],  # Flow Duration
-        len(flow_stats['flags']),                    # Unique Flags Count
-        # ... Add all 77 features here ...
+        duration,
+        total_packets,
+        total_bytes,
+        mean_pkt_size,
+        std_pkt_size,
+        max_pkt_size,
+        min_pkt_size,
+        pkt_rate,
+        byte_rate,
+        syn_count,
+        ack_count,
+        rst_count,
+        fin_count,
     ]
-    return np.array(features)
+
+    return np.array(features, dtype=np.float32)
+
 
 def analyze_flow(flow_id, stats):
     """Analyze completed network flow"""
