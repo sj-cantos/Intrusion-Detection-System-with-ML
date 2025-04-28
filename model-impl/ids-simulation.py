@@ -4,8 +4,8 @@ import joblib
 from torch import nn
 
 # Load preprocessing artifacts
-scaler = joblib.load("model-impl/scaler.pkl")
-label_encoder = joblib.load("model-impl/label_encoder.pkl")
+scaler = joblib.load("scaler.pkl")
+label_encoder = joblib.load("label_encoder.pkl")
 
 # Define the model architecture (must match training)
 class OriginalNet(nn.Module):
@@ -39,19 +39,58 @@ model = OriginalNet(
     input_size=scaler.n_features_in_,
     num_classes=len(label_encoder.classes_)
 ).to(device)
-model.load_state_dict(torch.load("model-impl/best_model.pth", map_location=device))
+model.load_state_dict(torch.load("best_model.pth", map_location=device))
 model.eval()
 
-def extract_features(raw_packet):
-    """Simulated feature extraction - replace with your actual implementation"""
-    # This should implement the same feature extraction as used in CICIDS2017
-    # For demonstration, return random features with correct dimension
-    return np.random.randn(scaler.n_features_in_)  # 77 features
+def extract_flow_features(flow_stats):
+    """Extract 77 flow features for model input (updated)."""
+    pkt_lengths = np.array(flow_stats['packet_lengths'])
+    iat = np.array(flow_stats['iat']) if flow_stats['iat'] else np.array([0])
+
+    total_packets = len(pkt_lengths)
+    total_bytes = pkt_lengths.sum()
+    duration = max(flow_stats['end_time'] - flow_stats['start_time'], 1e-6)  # Avoid divide-by-zero
+
+    features = [
+        total_packets,                     # Total packets
+        total_bytes,                        # Total bytes
+        total_bytes / duration,             # Bytes per second
+        total_packets / duration,           # Packets per second
+        pkt_lengths.mean() if total_packets else 0,  # Avg packet size
+        pkt_lengths.std() if total_packets else 0,   # Std dev packet size
+        pkt_lengths.min() if total_packets else 0,   # Min packet size
+        pkt_lengths.max() if total_packets else 0,   # Max packet size
+        iat.mean() if len(iat) > 0 else 0,   # Mean IAT
+        iat.std() if len(iat) > 0 else 0,    # Std IAT
+        iat.min() if len(iat) > 0 else 0,    # Min IAT
+        iat.max() if len(iat) > 0 else 0,    # Max IAT
+        len(flow_stats['flags']),            # Number of unique TCP flags
+        flow_stats['protocol'],              # Protocol (TCP=6, UDP=17, ICMP=1)
+        # ... continue adding features until you hit 77 ...
+    ]
+
+ 
+    # - Packet rate
+    # - Flag counts (SYN, ACK, etc.)
+    # - Ratios (incoming/outgoing)
+    # - Flow bytes per packet
+    # - Average header length
+    # - etc.
+
+    # Pad with zeros if less than 77
+    while len(features) < 77:
+        features.append(0.0)
+        
+    # Truncate if longer than 77
+    features = features[:77]
+
+    return np.array(features, dtype=np.float32)
+
 
 def preprocess_live_data(raw_packet):
     """Process raw network packet into model-ready format"""
     # Feature extraction
-    features = extract_features(raw_packet)
+    features = extract_flow_features(raw_packet)
     
     # Validate feature dimensions
     if len(features) != scaler.n_features_in_:
