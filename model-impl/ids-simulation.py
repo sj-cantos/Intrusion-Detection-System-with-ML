@@ -42,90 +42,71 @@ model = OriginalNet(
 model.load_state_dict(torch.load("best_model.pth", map_location=device))
 model.eval()
 
-def extract_flow_features(flow_stats):
-    """Extract 77 flow features for model input (updated)."""
-    pkt_lengths = np.array(flow_stats['packet_lengths'])
-    iat = np.array(flow_stats['iat']) if flow_stats['iat'] else np.array([0])
+from scapy.all import *
+import numpy as np
 
-    total_packets = len(pkt_lengths)
-    total_bytes = pkt_lengths.sum()
-    duration = max(flow_stats['end_time'] - flow_stats['start_time'], 1e-6)  # Avoid divide-by-zero
+def extract_flow_features(stats):
+    """
+    Extract features directly from flow statistics instead of raw packets.
+    """
+    syn_count = sum(1 for f in stats['flags'] if 'S' in str(f))  # Count SYN flags
+    total_packets = stats['packet_count']
+    packet_rate = total_packets / (stats['end_time'] - stats['start_time'] + 0.0001)
+    avg_packet_size = stats['bytes'] / total_packets if total_packets else 0
 
-    features = [
-        total_packets,                     # Total packets
-        total_bytes,                        # Total bytes
-        total_bytes / duration,             # Bytes per second
-        total_packets / duration,           # Packets per second
-        pkt_lengths.mean() if total_packets else 0,  # Avg packet size
-        pkt_lengths.std() if total_packets else 0,   # Std dev packet size
-        pkt_lengths.min() if total_packets else 0,   # Min packet size
-        pkt_lengths.max() if total_packets else 0,   # Max packet size
-        iat.mean() if len(iat) > 0 else 0,   # Mean IAT
-        iat.std() if len(iat) > 0 else 0,    # Std IAT
-        iat.min() if len(iat) > 0 else 0,    # Min IAT
-        iat.max() if len(iat) > 0 else 0,    # Max IAT
-        len(flow_stats['flags']),            # Number of unique TCP flags
-        flow_stats['protocol'],              # Protocol (TCP=6, UDP=17, ICMP=1)
-        # ... continue adding features until you hit 77 ...
-    ]
+    # Estimate source IP uniqueness as 1 (not available in stats)
+    # In full implementation, you'd track IPs per flow.
+    unique_ips = 1
 
- 
-    # - Packet rate
-    # - Flag counts (SYN, ACK, etc.)
-    # - Ratios (incoming/outgoing)
-    # - Flow bytes per packet
-    # - Average header length
-    # - etc.
-
-    # Pad with zeros if less than 77
-    while len(features) < 77:
-        features.append(0.0)
-        
-    # Truncate if longer than 77
-    features = features[:77]
-
-    return np.array(features, dtype=np.float32)
+    features = {
+        'syn_count': syn_count,
+        'total_packets': total_packets,
+        'packet_rate': packet_rate,
+        'unique_ips': unique_ips,
+        'average_packet_size': avg_packet_size,
+        'Protocol': stats.get('protocol', 0),  # Safely fetch 'protocol'
+        'attack_detected': syn_count > 50 and packet_rate > 10
+    }
 
 
-def preprocess_live_data(raw_packet):
-    """Process raw network packet into model-ready format"""
-    # Feature extraction
-    features = extract_flow_features(raw_packet)
-    
-    # Validate feature dimensions
-    if len(features) != scaler.n_features_in_:
-        raise ValueError(f"Expected {scaler.n_features_in_} features, got {len(features)}")
-    
+    return features
+
+
+
+
+
+
+
+def preprocess_live_data(features_dict):
+    # Drop 'attack_detected' if present
+    if 'attack_detected' in features_dict:
+        features_dict.pop('attack_detected')
+
+    # Ensure consistent feature order
+    feature_order = scaler.feature_names_in_
+    feature_vector = [features_dict[feat] for feat in feature_order]
+
     # Scale features
-    scaled = scaler.transform([features])
-    
+    scaled = scaler.transform([feature_vector])
+
     # Convert to tensor
-    return torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+    return torch.tensor(scaled, dtype=torch.float32).unsqueeze(1).to(device)  # Shape: [1, 1, num_features]
+
 
 import torch
 
-def detect_anomalies(features):
+def detect_anomalies(inputs_tensor):
     model.eval()
-
     with torch.no_grad():
-        inputs = torch.tensor(features, dtype=torch.float32)
-
-        # Reshape input: (batch_size=1, channels=1, length=features_dim)
-        inputs = inputs.unsqueeze(0).unsqueeze(0)  
-        # OR: inputs = inputs.view(1, 1, -1)
-
-        outputs = model(inputs)
-
+        outputs = model(inputs_tensor)
         probabilities = torch.softmax(outputs, dim=1)
         confidence, predicted_class = torch.max(probabilities, 1)
+        return {
+            'predicted_class': label_encoder.inverse_transform([predicted_class.item()])[0],
+            'confidence': confidence.item()
+        }
 
-        predicted_class = predicted_class.item()
-        confidence = confidence.item()
 
-    return {
-        'predicted_class': predicted_class,
-        'confidence': confidence
-    }
 
 
 from scapy.all import sniff, IP, TCP, UDP
@@ -188,113 +169,57 @@ flow_stats = {
     "packet_lengths": [],
     "flags": [],
 }
-def parse_flags(f):
-    from scapy.all import FlagValue
+# def parse_flags(f):
+#     from scapy.all import FlagValue
 
-    flag_map = {
-        'FIN': 0x01,
-        'SYN': 0x02,
-        'RST': 0x04,
-        'PSH': 0x08,
-        'ACK': 0x10,
-        'URG': 0x20,
-    }
+#     flag_map = {
+#         'FIN': 0x01,
+#         'SYN': 0x02,
+#         'RST': 0x04,
+#         'PSH': 0x08,
+#         'ACK': 0x10,
+#         'URG': 0x20,
+#     }
 
-    if isinstance(f, int):
-        return f
-    elif isinstance(f, FlagValue):
-        return int(f)
-    elif isinstance(f, set):
-        bits = 0
-        for flag in f:
-            flag_str = str(flag).upper()  # <--- MAKE SURE the flag is a string
-            bits |= flag_map.get(flag_str, 0)
-        return bits
-    else:
-        return 0
-
-def extract_flow_features(packet):
-    # Check if packet is a dict or scapy packet
-    if isinstance(packet, dict):
-        # Assume dict already has fields
-        packet_len = packet.get('length', 0)
-        flags = packet.get('flags', 0)
-    else:
-        # Scapy packet
-        packet_len = len(packet)
-        flags = 0
-        if packet.haslayer(TCP):
-            flags = packet[TCP].flags
-
-    # 1. Capture timestamp and packet length
-    flow_stats["timestamps"].append(time.time())
-    flow_stats["packet_lengths"].append(packet_len)
-    flow_stats["flags"].append(flags)
-
-    # 2. Compute features
-    timestamps = flow_stats["timestamps"]
-    packet_lengths = flow_stats["packet_lengths"]
-    flags_list = flow_stats["flags"]
-
-    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0
-
-    total_packets = len(packet_lengths)
-    total_bytes = np.sum(packet_lengths)
-    mean_pkt_size = np.mean(packet_lengths)
-    std_pkt_size = np.std(packet_lengths)
-    max_pkt_size = np.max(packet_lengths)
-    min_pkt_size = np.min(packet_lengths)
-
-    pkt_rate = total_packets / duration if duration > 0 else 0
-    byte_rate = total_bytes / duration if duration > 0 else 0
-
-    syn_count = sum(1 for f in flags_list if parse_flags(f) & 0x02)
-    ack_count = sum(1 for f in flags_list if parse_flags(f) & 0x10)
-    rst_count = sum(1 for f in flags_list if parse_flags(f) & 0x04)
-    fin_count = sum(1 for f in flags_list if parse_flags(f) & 0x01)
-
-    features = [
-        duration,
-        total_packets,
-        total_bytes,
-        mean_pkt_size,
-        std_pkt_size,
-        max_pkt_size,
-        min_pkt_size,
-        pkt_rate,
-        byte_rate,
-        syn_count,
-        ack_count,
-        rst_count,
-        fin_count,
-    ]
-
-    return np.array(features, dtype=np.float32)
+#     if isinstance(f, int):
+#         return f
+#     elif isinstance(f, FlagValue):
+#         return int(f)
+#     elif isinstance(f, set):
+#         bits = 0
+#         for flag in f:
+#             flag_str = str(flag).upper()  # <--- MAKE SURE the flag is a string
+#             bits |= flag_map.get(flag_str, 0)
+#         return bits
+#     else:
+#         return 0
 
 
-def analyze_flow(flow_id, stats):
-    """Analyze completed network flow"""
-    try:
-        # Extract features
-        features = extract_flow_features(stats)
+
+
+# def analyze_flow(flow_id, stats):
+#     """Analyze completed network flow"""
+#     try:
+#         # Extract features
+#         features = extract_flow_features(stats)
         
-        # Detect anomalies
-        result = detect_anomalies(features)  # Pass features directly
+#         # Detect anomalies
+#         result = detect_anomalies(features)  # Pass features directly
         
-        # Generate alert if anomaly detected
-        if result['predicted_class'] != 'Benign':
-            print(f" ANOMALY DETECTED ")
-            print(f"Flow: {flow_id[0]} → {flow_id[1]}")
-            print(f"Type: {result['predicted_class']}")
-            print(f"Confidence: {result['confidence']:.2%}")
+#         # Generate alert if anomaly detected
+#         if result['predicted_class'] != 'Benign':
+#             print(f" ANOMALY DETECTED ")
+#             print(f"Flow: {flow_id[0]} → {flow_id[1]}")
+#             print(f"Type: {result['predicted_class']}")
+#             print(f"Confidence: {result['confidence']:.2%}")
             
-            # Add your alerting logic here (email, SMS, SIEM integration, etc.)
+#             # Add your alerting logic here (email, SMS, SIEM integration, etc.)
             
-        else:
-            print(f"✓ Normal traffic: {flow_id[0]} → {flow_id[1]}")
+#         else:
+#             print(f"✓ Normal traffic: {flow_id[0]} → {flow_id[1]}")
 
-    except Exception as e:
-        print(f"Error analyzing flow: {e}")
+#     except Exception as e:
+#         print(f"Error analyzing flow: {e}")
 
 import logging
 from scapy.all import (
@@ -329,48 +254,99 @@ def packet_handler(packet):
     except Exception as e:
         logging.error(f"Error processing packet: {e}")
 
-if __name__ == "__main__":
-    show_interfaces()
-    interface = "Wi-Fi"  # Update to your correct interface
+import time
+from scapy.all import sniff, IP, TCP
+from collections import defaultdict
+import torch
 
-    print(f"\nStarting monitoring on {interface}...")
-    print("Send test traffic (e.g., ping or browse) to verify")
-    print("Press Ctrl+C to stop\n")
+# Flow tracking dictionary
+flow_stats = defaultdict(lambda: {
+    'start_time': None,
+    'end_time': None,
+    'packet_count': 0,
+    'bytes': 0,
+    'protocol': None,
+    'flags': set(),
+    'packet_lengths': [],
+    'iat': []  # Inter-arrival times
+})
 
+def process_packet(packet):
+    """Process live network packets and maintain flow statistics"""
     try:
-        # Capture packets temporarily for verification
-        packets = sniff(
-            iface=interface,
-            filter="tcp or udp or icmp",
-            prn=packet_handler,
-            store=1,
-            timeout=10
-        )
-        
-        # Instead of passing raw packets, simulate a flow first
-        if packets:
-            # Create a dummy flow_stats from captured packets (basic example)
-            dummy_flow = {
-                'start_time': time.time(),
-                'end_time': time.time() + 1,
-                'packet_count': len(packets),
-                'bytes': sum(len(pkt) for pkt in packets),
-                'protocol': packets[0][IP].proto if IP in packets[0] else None,
-                'flags': set(pkt[TCP].flags for pkt in packets if TCP in pkt),
-                'packet_lengths': [len(pkt) for pkt in packets],
-                'iat': []  # Could calculate real IATs if needed
-            }
+        if IP in packet:
+            current_time = time.time()  # Get timestamp once per packet
 
-            # Now properly extract features
-            features = extract_flow_features(dummy_flow)
+            src = f"{packet[IP].src}:{packet.sport}" if TCP in packet else packet[IP].src
+            dst = f"{packet[IP].dst}:{packet.dport}" if TCP in packet else packet[IP].dst
+            flow_id = (src, dst) if src < dst else (dst, src)
 
-            # Then detect anomaly
-            result = detect_anomalies(features)
+            # Update flow statistics
+            stats = flow_stats[flow_id]
+            if not stats['start_time']:
+                stats['start_time'] = current_time
+                stats['protocol'] = packet[IP].proto
+                stats['end_time'] = current_time  # Initialize end_time
+            else:
+                # Calculate inter-arrival time correctly
+                stats['iat'].append(current_time - stats['end_time'])
+                stats['end_time'] = current_time
 
-            print(f"Predicted: {result['predicted_class']}")
+            stats['packet_count'] += 1
+            stats['bytes'] += len(packet)
+            stats['packet_lengths'].append(len(packet))
+
+            if TCP in packet:
+                stats['flags'].add(packet[TCP].flags)
+
+            # Check flow timeout (e.g., 15 seconds of inactivity)
+            if current_time - stats['end_time'] > 15:
+                analyze_flow(flow_id, stats)
+                del flow_stats[flow_id]
+
+    except Exception as e:
+        print(f"Error processing packet: {e}")
+
+def analyze_flow(flow_id, stats):
+    try:
+        # Extract and preprocess features
+        features = extract_flow_features(stats)  # You might need to simulate a list of packets
+        input_tensor = preprocess_live_data(features)
+
+        # Classify
+        result = detect_anomalies(input_tensor)
+
+        if result['predicted_class'] != 'Benign':
+            print(f"🚨 ANOMALY DETECTED in flow: {flow_id[0]} → {flow_id[1]}")
+            print(f"Type: {result['predicted_class']}")
             print(f"Confidence: {result['confidence']:.2%}")
         else:
-            print("No packets captured.")
+            print(f"✓ Normal traffic: {flow_id[0]} → {flow_id[1]}")
 
+    except Exception as e:
+        print(f"Error analyzing flow: {e}")
+
+
+
+# Start sniffing packets and process them
+def start_sniffing(interface="Wi-Fi"):
+    print(f"\nStarting monitoring on {interface}...")
+    try:
+        # Capture packets in real-time
+        sniff(iface=interface, filter="ip", prn=process_packet, store=0)
     except KeyboardInterrupt:
         print("\nMonitoring stopped by user.")
+import atexit
+
+def flush_remaining_flows():
+    for flow_id, stats in list(flow_stats.items()):
+        analyze_flow(flow_id, stats)
+    flow_stats.clear()
+
+atexit.register(flush_remaining_flows)
+
+if __name__ == "__main__":
+    show_interfaces()
+    iface = input("Enter interface to monitor (default: Wi-Fi): ") or "Wi-Fi"
+    start_sniffing(interface=iface)
+
